@@ -1,0 +1,33 @@
+NERDS GATE ON GITHUB + RENDER
+
+YES, you can use GitHub + Render.com.
+
+Files to upload to a GitHub repo:
+  nerds_gate.py
+  render.yaml
+
+Render setup:
+1. Create a GitHub repo, for example Nerds-Gate.
+2. Upload nerds_gate.py and render.yaml.
+3. Go to Render Dashboard.
+4. New > Blueprint, then connect the GitHub repo.
+   If not using Blueprint, choose New > Web Service.
+5. Runtime: Python
+6. Build Command:
+   python -m py_compile nerds_gate.py
+7. Start Command:
+   python nerds_gate.py
+8. Deploy.
+
+Render gives you a URL like:
+  https://nerds-gate.onrender.com
+
+Use this in Nerds Portal > Network:
+  Mode: Internet Mode
+  Gate URL: wss://nerds-gate.onrender.com/ws
+  Press Connect Gate
+
+Important:
+- Render free web services can sleep after idle time.
+- If asleep, first connection can take about a minute.
+- For always-online production, use a paid Render instance or any always-on server.

@@ -1,0 +1,2337 @@
+# VX:name=Nerds Portal v0.10 Contacts
+# VX:icon=NP
+# VX:version=0.10
+# VX:author=Vincent Ilagan
+# VX:net=web
+"""
+Nerds Portal v0.10
+
+Local-first portal for Luci OS users:
+- creates a Nerds Number in the +153 + 6 digit format
+- stores a local device identity, rooms, mini feed, and file-drop queue
+- runs an optional self-hosted portal endpoint inside this app
+- sends messages directly on LAN or internationally through Nerds Gate
+
+LAN Mode is direct. Internet Mode uses a Nerds Gate relay over WebSocket so
+both users can connect outbound from NAT/CGNAT networks.
+"""
+
+import datetime as _dt
+import base64
+import concurrent.futures
+import hashlib
+import html
+import json
+import os
+import queue
+import re
+import secrets
+import socket
+import ssl
+import struct
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.machinery import SourceFileLoader
+from urllib.parse import urlparse
+
+from PyQt5.QtCore import Qt, QByteArray, QBuffer, QIODevice, QTimer
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+PROG_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(PROG_DIR)
+USER_DIR = os.path.join(ROOT_DIR, ".user")
+IDENTITY_FILE = os.path.join(USER_DIR, "nerds_portal_identity.json")
+ROOMS_FILE = os.path.join(USER_DIR, "nerds_portal_rooms.json")
+FEED_FILE = os.path.join(USER_DIR, "nerds_portal_feed.json")
+DROP_FILE = os.path.join(USER_DIR, "nerds_portal_drops.json")
+MESSAGES_FILE = os.path.join(USER_DIR, "nerds_portal_messages.json")
+CONTACTS_FILE = os.path.join(USER_DIR, "nerds_portal_contacts.json")
+SELFHOST_FILE = os.path.join(USER_DIR, "nerds_portal_selfhost.json")
+DISCOVERY_FILE = os.path.join(USER_DIR, "nerds_portal_discovery.json")
+GATE_FILE = os.path.join(USER_DIR, "nerds_portal_gate.json")
+DEFAULT_SELF_PORT = 15353
+DISCOVERY_PORT = 15354
+
+_app = SourceFileLoader("luci_app", os.path.join(PROG_DIR, "app.vx")).load_module()
+LuciWindow = _app.LuciWindow
+
+NUMBER_RE = re.compile(r"^\+153\d{6}$")
+
+
+def _clean_number(text):
+    raw = re.sub(r"[\s\-()]+", "", str(text or ""))
+    if re.fullmatch(r"\d{6}", raw):
+        return "+153" + raw
+    if raw.startswith("153") and re.fullmatch(r"153\d{6}", raw):
+        return "+" + raw
+    return raw
+
+
+def _now():
+    return _dt.datetime.now().replace(microsecond=0).isoformat()
+
+
+def _ensure_user_dir():
+    os.makedirs(USER_DIR, exist_ok=True)
+
+
+def _load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path, data):
+    _ensure_user_dir()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _new_nerds_number():
+    return "+153" + "".join(secrets.choice("0123456789") for _ in range(6))
+
+
+def _new_code(prefix="NRD"):
+    a = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+    b = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+    return f"{prefix}-{a}-{b}"
+
+
+def _new_device_id(display_name):
+    base = "".join(ch for ch in display_name.upper() if ch.isalnum())[:6] or "NERD"
+    return f"{base}-{secrets.token_hex(3).upper()}"
+
+
+def _keypair_stub():
+    private = secrets.token_hex(32)
+    public = hashlib.sha256(private.encode("utf-8")).hexdigest()
+    return private, public
+
+
+def _short(text, length=12):
+    if not text:
+        return ""
+    return text[:length]
+
+
+def _normalize_url(url):
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url.rstrip("/")
+
+
+def _local_ip():
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def _find_free_port(start=DEFAULT_SELF_PORT):
+    for port in range(start, start + 100):
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("0.0.0.0", port))
+            return port
+        except Exception:
+            pass
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("0.0.0.0", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def _preferred_port_for_number(number):
+    number = _clean_number(number)
+    if NUMBER_RE.match(number):
+        return 10000 + int(number[-4:])
+    return DEFAULT_SELF_PORT
+
+
+def _local_ipv4s():
+    ips = set()
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            ips.add(ip)
+    except Exception:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except Exception:
+        pass
+    return sorted(ip for ip in ips if ip and not ip.startswith("127.") and ip.count(".") == 3)
+
+
+def _ws_recv_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("websocket closed")
+        data += chunk
+    return data
+
+
+def _ws_send_frame(sock, payload, opcode=1, masked=True):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    first = 0x80 | opcode
+    mask_bit = 0x80 if masked else 0
+    length = len(payload)
+    if length < 126:
+        header = bytes([first, mask_bit | length])
+    elif length <= 0xFFFF:
+        header = bytes([first, mask_bit | 126]) + struct.pack("!H", length)
+    else:
+        header = bytes([first, mask_bit | 127]) + struct.pack("!Q", length)
+    if not masked:
+        sock.sendall(header + payload)
+        return
+    key = os.urandom(4)
+    masked_payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+    sock.sendall(header + key + masked_payload)
+
+
+def _ws_recv_frame(sock):
+    first, second = _ws_recv_exact(sock, 2)
+    opcode = first & 0x0F
+    masked = bool(second & 0x80)
+    length = second & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _ws_recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _ws_recv_exact(sock, 8))[0]
+    key = _ws_recv_exact(sock, 4) if masked else b""
+    payload = _ws_recv_exact(sock, length) if length else b""
+    if masked:
+        payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+class NerdsGateClient:
+    def __init__(self, portal, url, events):
+        self.portal = portal
+        self.url = url
+        self.events = events
+        self.sock = None
+        self.thread = None
+        self.lock = threading.Lock()
+        self.running = False
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        sock = self.sock
+        self.sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def send(self, item):
+        raw = json.dumps(item, ensure_ascii=False)
+        with self.lock:
+            if self.sock is None:
+                raise ConnectionError("Nerds Gate is not connected")
+            _ws_send_frame(self.sock, raw, masked=True)
+
+    def _connect_socket(self):
+        parsed = urlparse(self.url)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("ws", "wss"):
+            raise ValueError("Gate URL must start with ws:// or wss://")
+        host = parsed.hostname
+        if not host:
+            raise ValueError("Gate URL missing host")
+        port = parsed.port or (443 if scheme == "wss" else 80)
+        path = parsed.path or "/ws"
+        if parsed.query:
+            path += "?" + parsed.query
+        raw = socket.create_connection((host, port), timeout=8)
+        if scheme == "wss":
+            raw = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        raw.sendall(request.encode("ascii"))
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+            if len(response) > 65536:
+                break
+        if b" 101 " not in response.split(b"\r\n", 1)[0]:
+            raise ConnectionError(response.decode("utf-8", "replace").splitlines()[0] if response else "Gate handshake failed")
+        raw.settimeout(1.0)
+        return raw
+
+    def _register(self):
+        ident = self.portal.identity or {}
+        self.send({
+            "protocol": "nerds.gate.v1",
+            "type": "register",
+            "number": _clean_number(ident.get("portal_number", "")),
+            "name": ident.get("display_name", ""),
+            "device_id": ident.get("device_id", ""),
+            "client_version": self.portal.VERSION,
+            "sent_at": _now(),
+        })
+
+    def _loop(self):
+        while self.running:
+            try:
+                self.events.put({"type": "gate_status", "text": "Connecting to Nerds Gate..."})
+                self.sock = self._connect_socket()
+                self._register()
+                self.events.put({"type": "gate_status", "text": "Internet Mode online via Nerds Gate"})
+                while self.running and self.sock is not None:
+                    try:
+                        opcode, payload = _ws_recv_frame(self.sock)
+                    except socket.timeout:
+                        continue
+                    if opcode == 8:
+                        raise ConnectionError("Gate closed the connection")
+                    if opcode == 9:
+                        with self.lock:
+                            if self.sock is not None:
+                                _ws_send_frame(self.sock, payload, opcode=10, masked=True)
+                        continue
+                    if opcode != 1:
+                        continue
+                    item = json.loads(payload.decode("utf-8", "replace"))
+                    self.events.put(item)
+            except Exception as exc:
+                if self.running:
+                    self.events.put({"type": "gate_status", "text": f"Gate offline: {exc}"})
+                    time.sleep(3)
+            finally:
+                sock = self.sock
+                self.sock = None
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+
+class NerdsPortal(LuciWindow):
+    TITLE = "Nerds Portal v0.10 Contacts"
+    ICON = "NP"
+    SIZE = (980, 700)
+    VERSION = "0.10"
+    AUTHOR = "Vincent Ilagan"
+    ABOUT = "Local-first portal identity, direct chat, rooms, feed, and file-drop prototype."
+
+    def __init__(self, desktop=None):
+        self.identity = _load_json(IDENTITY_FILE, {})
+        self.rooms = _load_json(ROOMS_FILE, [])
+        self.feed = _load_json(FEED_FILE, [])
+        self.drops = _load_json(DROP_FILE, [])
+        self.messages = _load_json(MESSAGES_FILE, [])
+        self.contacts = _load_json(CONTACTS_FILE, {})
+        self.selfhost = _load_json(SELFHOST_FILE, {"port": DEFAULT_SELF_PORT})
+        self.gate = _load_json(GATE_FILE, {"mode": "Hybrid Auto Mode", "url": "wss://nerdsgate.onrender.com/ws"})
+        self.httpd = None
+        self.http_thread = None
+        self.gate_client = None
+        self.gate_events = queue.Queue()
+        self.gate_status = "Nerds Gate offline"
+        self.online_numbers = set()
+        self.last_online_check = 0
+        self.active_chat_number = ""
+        self.live_room = None
+        self.snapshot_timer = None
+        self.live_snapshot = {}
+        self.discovery_sock = None
+        self.discovery_thread = None
+        self.discovery_stop = False
+        self.discovery_status = "LAN discovery offline"
+        self.message_timer = None
+        self.last_message_count = len(self.messages) if isinstance(self.messages, list) else 0
+        super().__init__(desktop)
+        self.message_timer = QTimer(self)
+        self.message_timer.timeout.connect(self._heartbeat)
+        self.message_timer.start(1000)
+
+    def build_body(self, layout):
+        layout.setSpacing(10)
+        self.setStyleSheet("""
+            QLabel { color: rgba(245,250,255,218); }
+            QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {
+                background: rgba(5,10,24,185);
+                color: #f5faff;
+                border: 1px solid rgba(255,255,255,38);
+                border-radius: 6px;
+                padding: 7px;
+                selection-background-color: #4c8dff;
+            }
+            QPushButton {
+                background: rgba(76,141,255,170);
+                color: white;
+                border: 1px solid rgba(255,255,255,45);
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: rgba(95,158,255,210); }
+            QListWidget {
+                background: rgba(5,10,24,145);
+                color: #f5faff;
+                border: 1px solid rgba(255,255,255,30);
+                border-radius: 6px;
+                padding: 6px;
+            }
+            QGroupBox {
+                color: #a9c7ff;
+                border: 1px solid rgba(255,255,255,32);
+                border-radius: 8px;
+                margin-top: 12px;
+                padding: 10px;
+                font-weight: 700;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+            QTabWidget::pane { border: 1px solid rgba(255,255,255,28); border-radius: 8px; }
+            QTabBar::tab {
+                background: rgba(255,255,255,16);
+                color: #dce8ff;
+                padding: 8px 12px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            QTabBar::tab:selected { background: rgba(76,141,255,130); color: white; }
+        """)
+
+        header = QLabel(
+            "Nerds Portal uses direct self-hosting. Each user runs their own local Portal URL and shares it only with trusted contacts."
+        )
+        header.setWordWrap(True)
+        header.setStyleSheet("color:#c8d8ff;font-weight:600;")
+        layout.addWidget(header)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._identity_tab(), "Identity")
+        self.tabs.addTab(self._chat_tab(), "Inbox / Chat")
+        self.tabs.addTab(self._selfhost_tab(), "Network")
+        self.tabs.addTab(self._live_tab(), "Live")
+        self.tabs.addTab(self._room_tab(), "Portal Room")
+        self.tabs.addTab(self._feed_tab(), "Mini Feed")
+        self.tabs.addTab(self._drop_tab(), "File Drop")
+        self.tabs.addTab(self._safety_tab(), "Safety")
+        layout.addWidget(self.tabs, 1)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet("color:#9fb8e8;")
+        layout.addWidget(self.status)
+        self._refresh_all()
+
+    def _identity_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        box = QGroupBox("First Setup")
+        form = QFormLayout(box)
+        self.name_in = QLineEdit()
+        self.name_in.setPlaceholderText("Vincent")
+        self.device_in = QLineEdit()
+        self.device_in.setPlaceholderText("Vincent PC")
+        self.privacy_in = QComboBox()
+        self.privacy_in.addItems(["Private", "Friends only", "Public creator mode"])
+        form.addRow("Display name", self.name_in)
+        form.addRow("Device name", self.device_in)
+        form.addRow("Default privacy", self.privacy_in)
+        lay.addWidget(box)
+
+        btns = QHBoxLayout()
+        self.create_id_btn = QPushButton("Create / Update Nerd ID")
+        self.create_id_btn.clicked.connect(self._create_identity)
+        self.regen_num_btn = QPushButton("Generate New +153 Number")
+        self.regen_num_btn.clicked.connect(self._regenerate_number)
+        btns.addWidget(self.create_id_btn)
+        btns.addWidget(self.regen_num_btn)
+        btns.addStretch()
+        lay.addLayout(btns)
+
+        self.identity_view = QTextEdit()
+        self.identity_view.setReadOnly(True)
+        self.identity_view.setMinimumHeight(220)
+        lay.addWidget(self.identity_view, 1)
+        return page
+
+    def _chat_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        self.chat_title = QLabel("Messages")
+        self.chat_title.setStyleSheet("color:#f4f8ff; font-size:18px; font-weight:800;")
+        self.chat_status = QLabel("Choose a chat or type a Nerds Number.")
+        self.chat_status.setStyleSheet("color:#9fb8e8;")
+        top.addWidget(self.chat_title)
+        top.addStretch()
+        top.addWidget(self.chat_status)
+        lay.addLayout(top)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+
+        left = QVBoxLayout()
+        recent_label = QLabel("Chats")
+        recent_label.setStyleSheet("color:#dbe8ff; font-weight:700;")
+        self.chat_contacts = QListWidget()
+        self.chat_contacts.setMinimumWidth(190)
+        self.chat_contacts.setMaximumWidth(240)
+        self.chat_contacts.itemClicked.connect(self._select_chat_contact)
+        self.chat_contacts.setStyleSheet(
+            "QListWidget{background:#071122;border:1px solid #263d67;border-radius:8px;color:#dbe8ff;padding:6px;}"
+            "QListWidget::item{padding:10px 8px;border-radius:6px;}"
+            "QListWidget::item:selected{background:#2f67c7;color:white;}"
+        )
+        left.addWidget(recent_label)
+        left.addWidget(self.chat_contacts, 1)
+        body.addLayout(left)
+
+        chat_side = QVBoxLayout()
+        target_row = QHBoxLayout()
+        target_label = QLabel("To")
+        target_label.setStyleSheet("color:#9fb8e8; font-weight:700;")
+        self.to_number = QLineEdit()
+        self.to_number.setPlaceholderText("075561 or +153075561")
+        self.to_number.textChanged.connect(self._fill_contact_url)
+        self.to_number.textChanged.connect(self._refresh_messages)
+        self.contact_name = QLineEdit()
+        self.contact_name.setPlaceholderText("Contact name")
+        self.save_contact_btn = QPushButton("Save")
+        self.save_contact_btn.clicked.connect(self._save_chat_contact)
+        self.contact_route = QLabel("Internet Gate is used when both users are connected.")
+        self.contact_route.setStyleSheet("color:#9fb8e8;")
+        target_row.addWidget(target_label)
+        target_row.addWidget(self.to_number, 2)
+        target_row.addWidget(self.contact_name, 1)
+        target_row.addWidget(self.save_contact_btn)
+        chat_side.addLayout(target_row)
+        chat_side.addWidget(self.contact_route)
+
+        self.message_list = QTextEdit()
+        self.message_list.setReadOnly(True)
+        self.message_list.setMinimumHeight(300)
+        self.message_list.setStyleSheet(
+            "QTextEdit{background:#061024;border:1px solid #263d67;border-radius:10px;color:#e8f0ff;padding:10px;}"
+        )
+        chat_side.addWidget(self.message_list, 1)
+
+        composer = QHBoxLayout()
+        self.chat_text = QPlainTextEdit()
+        self.chat_text.setPlaceholderText("Write a message...")
+        self.chat_text.setMaximumHeight(76)
+        self.send_msg_btn = QPushButton("Send")
+        self.send_msg_btn.clicked.connect(self._send_message)
+        self.sync_msg_btn = QPushButton("Refresh")
+        self.sync_msg_btn.clicked.connect(self._refresh_messages)
+        composer.addWidget(self.chat_text, 1)
+        composer.addWidget(self.send_msg_btn)
+        composer.addWidget(self.sync_msg_btn)
+        chat_side.addLayout(composer)
+
+        self.contact_card_in = QLineEdit()
+        self.import_contact_btn = QPushButton("Import Card")
+        self.import_contact_btn.clicked.connect(self._import_contact_card)
+        self.contact_card_in.hide()
+        self.import_contact_btn.hide()
+
+        body.addLayout(chat_side, 1)
+        lay.addLayout(body, 1)
+        return page
+
+    def _selfhost_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        box = QGroupBox("Auto Network")
+        grid = QGridLayout(box)
+        self.local_url = QLineEdit()
+        self.local_url.setReadOnly(True)
+        self.my_contact_card = QLineEdit()
+        self.my_contact_card.setReadOnly(True)
+        self.start_host_btn = QPushButton("Go Online")
+        self.start_host_btn.clicked.connect(self._toggle_self_server)
+        self.copy_card_btn = QPushButton("Copy Card")
+        self.copy_card_btn.clicked.connect(self._copy_my_contact_card)
+        grid.addWidget(QLabel("Status"), 0, 0)
+        grid.addWidget(self.local_url, 0, 1)
+        grid.addWidget(self.start_host_btn, 0, 2)
+        grid.addWidget(QLabel("My Contact Card"), 1, 0)
+        grid.addWidget(self.my_contact_card, 1, 1)
+        grid.addWidget(self.copy_card_btn, 1, 2)
+        lay.addWidget(box)
+
+        gate_box = QGroupBox("Nerds Gate Internet")
+        gate_grid = QGridLayout(gate_box)
+        self.route_mode = QComboBox()
+        self.route_mode.addItems(["Hybrid Auto Mode", "Internet Mode", "LAN Mode"])
+        saved_mode = self.gate.get("mode", "Hybrid Auto Mode")
+        mode_index = self.route_mode.findText(saved_mode)
+        self.route_mode.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self.route_mode.currentTextChanged.connect(self._save_gate_settings)
+        self.gate_url = QLineEdit()
+        self.gate_url.setPlaceholderText("wss://nerdsgate.onrender.com/ws")
+        self.gate_url.setText(self.gate.get("url", "wss://nerdsgate.onrender.com/ws"))
+        self.gate_url.textChanged.connect(self._save_gate_settings)
+        self.gate_btn = QPushButton("Connect Gate")
+        self.gate_btn.clicked.connect(self._toggle_gate)
+        self.gate_status_label = QLabel(self.gate_status)
+        self.gate_status_label.setStyleSheet("color:#a9c7ff;")
+        gate_grid.addWidget(QLabel("Mode"), 0, 0)
+        gate_grid.addWidget(self.route_mode, 0, 1)
+        gate_grid.addWidget(self.gate_btn, 0, 2)
+        gate_grid.addWidget(QLabel("Gate URL"), 1, 0)
+        gate_grid.addWidget(self.gate_url, 1, 1, 1, 2)
+        gate_grid.addWidget(QLabel("Gate Status"), 2, 0)
+        gate_grid.addWidget(self.gate_status_label, 2, 1, 1, 2)
+        lay.addWidget(gate_box)
+
+        self.selfhost_info = QTextEdit()
+        self.selfhost_info.setReadOnly(True)
+        self.selfhost_info.setText(
+            f"Nerds Portal v{self.VERSION}\n\n"
+            "Go Online binds this app's auto URL to your +153 Nerds Number.\n\n"
+            "On the same device or local network, another Nerds Portal can send by number after both apps are online.\n"
+            "Contact Card stays as fallback when auto discovery is not available."
+        )
+        lay.addWidget(self.selfhost_info, 1)
+        return page
+
+    def _live_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        target_box = QGroupBox("Live Target")
+        grid = QGridLayout(target_box)
+        self.live_number = QLineEdit()
+        self.live_number.setPlaceholderText("+153 number to check or view")
+        self.live_status = QLabel("Go Online first, then type a +153 number.")
+        self.live_status.setStyleSheet("color:#a9c7ff;")
+        self.check_live_btn = QPushButton("Check Online")
+        self.check_live_btn.clicked.connect(self._check_live_target)
+        self.fetch_rooms_btn = QPushButton("Rooms")
+        self.fetch_rooms_btn.clicked.connect(self._fetch_live_rooms)
+        self.fetch_feed_btn = QPushButton("Feed")
+        self.fetch_feed_btn.clicked.connect(self._fetch_live_feed)
+        self.fetch_drops_btn = QPushButton("Files")
+        self.fetch_drops_btn.clicked.connect(self._fetch_live_drops)
+        grid.addWidget(QLabel("Target"), 0, 0)
+        grid.addWidget(self.live_number, 0, 1, 1, 4)
+        grid.addWidget(self.check_live_btn, 1, 1)
+        grid.addWidget(self.fetch_rooms_btn, 1, 2)
+        grid.addWidget(self.fetch_feed_btn, 1, 3)
+        grid.addWidget(self.fetch_drops_btn, 1, 4)
+        grid.addWidget(QLabel("Status"), 2, 0)
+        grid.addWidget(self.live_status, 2, 1, 1, 4)
+        lay.addWidget(target_box)
+
+        share_box = QGroupBox("Snapshot Share")
+        share_lay = QHBoxLayout(share_box)
+        self.snapshot_btn = QPushButton("Start Snapshot Share")
+        self.snapshot_btn.clicked.connect(self._toggle_snapshot_share)
+        self.view_snapshot_btn = QPushButton("View Target Snapshot")
+        self.view_snapshot_btn.clicked.connect(self._view_live_snapshot)
+        share_lay.addWidget(self.snapshot_btn)
+        share_lay.addWidget(self.view_snapshot_btn)
+        share_lay.addStretch()
+        lay.addWidget(share_box)
+
+        self.live_view = QTextEdit()
+        self.live_view.setReadOnly(True)
+        self.live_view.setText(
+            "Live test tools:\n"
+            "- Check Online resolves a +153 number automatically.\n"
+            "- Rooms/Feed/Files pull from the target app.\n"
+            "- Snapshot Share sends a low-res screen snapshot only after you press Start."
+        )
+        lay.addWidget(self.live_view, 1)
+        return page
+
+    def _room_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        box = QGroupBox("Create Portal Room")
+        grid = QGridLayout(box)
+        self.room_title = QLineEdit()
+        self.room_title.setPlaceholderText("Render test / file room / live preview")
+        self.room_type = QComboBox()
+        self.room_type.addItems(["Live Room", "File Room", "Render Room", "Mixed Room"])
+        self.room_mode = QComboBox()
+        self.room_mode.addItems(["Private code", "Contacts only", "Public on my self-server"])
+        self.room_notes = QPlainTextEdit()
+        self.room_notes.setPlaceholderText("Short description for trusted contacts.")
+        self.room_notes.setMaximumHeight(90)
+        grid.addWidget(QLabel("Title"), 0, 0)
+        grid.addWidget(self.room_title, 0, 1)
+        grid.addWidget(QLabel("Type"), 1, 0)
+        grid.addWidget(self.room_type, 1, 1)
+        grid.addWidget(QLabel("Mode"), 2, 0)
+        grid.addWidget(self.room_mode, 2, 1)
+        grid.addWidget(QLabel("Notes"), 3, 0, Qt.AlignTop)
+        grid.addWidget(self.room_notes, 3, 1)
+        lay.addWidget(box)
+
+        row = QHBoxLayout()
+        self.create_room_btn = QPushButton("Create Room")
+        self.create_room_btn.clicked.connect(self._create_room)
+        self.new_code_btn = QPushButton("New Private Code")
+        self.new_code_btn.clicked.connect(self._new_selected_room_code)
+        self.room_host_btn = QPushButton("Start Self Server")
+        self.room_host_btn.clicked.connect(self._toggle_self_server)
+        row.addWidget(self.create_room_btn)
+        row.addWidget(self.new_code_btn)
+        row.addWidget(self.room_host_btn)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.room_list = QListWidget()
+        lay.addWidget(self.room_list, 1)
+        return page
+
+    def _feed_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        box = QGroupBox("Post to Local Mini Feed")
+        form = QVBoxLayout(box)
+        self.feed_text = QPlainTextEdit()
+        self.feed_text.setPlaceholderText("Example: Rendering test sa Luci OS.")
+        self.feed_text.setMaximumHeight(100)
+        form.addWidget(self.feed_text)
+        row = QHBoxLayout()
+        self.post_btn = QPushButton("Add Local Feed Post")
+        self.post_btn.clicked.connect(self._add_feed)
+        self.clear_feed_btn = QPushButton("Clear Feed")
+        self.clear_feed_btn.clicked.connect(self._clear_feed)
+        row.addWidget(self.post_btn)
+        row.addWidget(self.clear_feed_btn)
+        row.addStretch()
+        form.addLayout(row)
+        lay.addWidget(box)
+
+        self.feed_list = QListWidget()
+        lay.addWidget(self.feed_list, 1)
+
+        self.peer_list = QListWidget()
+        self.peer_list.setMinimumHeight(120)
+        lay.addWidget(QLabel("Saved direct contacts"))
+        lay.addWidget(self.peer_list)
+        return page
+
+    def _drop_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        info = QLabel("File Drop records files you want to portal later. Actual encrypted transfer is not enabled yet.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        row = QHBoxLayout()
+        self.pick_file_btn = QPushButton("Choose File")
+        self.pick_file_btn.clicked.connect(self._choose_file)
+        self.clear_drop_btn = QPushButton("Clear Queue")
+        self.clear_drop_btn.clicked.connect(self._clear_drops)
+        row.addWidget(self.pick_file_btn)
+        row.addWidget(self.clear_drop_btn)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.drop_list = QListWidget()
+        lay.addWidget(self.drop_list, 1)
+        return page
+
+    def _safety_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setText(
+            "Nerds Portal safety defaults\n\n"
+            "1. Private by default.\n"
+            "2. +153 Nerds Number is an internal Luci address, not a real phone number.\n"
+            "3. Display name is only a label. Device key/fingerprint proves identity.\n"
+            "4. Internet Mode uses Nerds Gate as a relay; private encryption is the next layer.\n"
+            "5. Only chat with numbers you trust.\n"
+            "6. File receiving must require approval.\n"
+            "7. Render Portal must require trusted devices and sandboxed jobs.\n"
+            "8. For internet access, prefer your own VPN mesh, tunnel, domain, or port-forwarding rule.\n\n"
+            "Next engineering layer: encrypted sessions, contact verification, file chunking, WebRTC/P2P streaming, and render-job sandbox."
+        )
+        lay.addWidget(text, 1)
+        return page
+
+    def _refresh_all(self):
+        self._refresh_identity()
+        self._refresh_messages()
+        self._refresh_rooms()
+        self._refresh_feed()
+        self._refresh_drops()
+        self._refresh_selfhost()
+
+    def _refresh_identity(self):
+        ident = self.identity or {}
+        self.name_in.setText(ident.get("display_name", ""))
+        self.device_in.setText(ident.get("device_name", ""))
+        privacy = ident.get("privacy_default", "Private")
+        idx = self.privacy_in.findText(privacy)
+        self.privacy_in.setCurrentIndex(idx if idx >= 0 else 0)
+        if not ident:
+            self.identity_view.setText("No Nerd ID yet. Enter a display name, then create one.")
+            return
+        public_key = ident.get("public_key", "")
+        private_key = ident.get("private_key", "")
+        self.identity_view.setText(
+            f"Display name: {ident.get('display_name', '')}\n"
+            f"Nerds Number: {ident.get('portal_number', '')}\n"
+            f"Device name: {ident.get('device_name', '')}\n"
+            f"Device ID: {ident.get('device_id', '')}\n"
+            f"Portal URL: {ident.get('portal_url', '')}\n"
+            f"Trust level: {ident.get('trust_level', 0)} - local only\n"
+            f"Privacy default: {ident.get('privacy_default', 'Private')}\n"
+            f"Created: {ident.get('created_at', '')}\n"
+            f"Updated: {ident.get('updated_at', '')}\n\n"
+            f"Public fingerprint: {_short(public_key, 24)}...\n"
+            f"Private key stored locally: {'yes' if private_key else 'no'}\n\n"
+            "Share the Nerds Number and Portal URL only with people you trust. "
+            "Do not treat either one as a password."
+        )
+
+    def _refresh_rooms(self):
+        self.room_list.clear()
+        if not self.rooms:
+            self.room_list.addItem("No rooms yet.")
+            return
+        for room in reversed(self.rooms[-50:]):
+            self.room_list.addItem(
+                f"{room.get('code')} | {room.get('mode')} | "
+                f"{room.get('room_type')} | {room.get('title')} | {room.get('created_at')}"
+            )
+
+    def _refresh_messages(self):
+        if not hasattr(self, "message_list"):
+            return
+        self.messages = _load_json(MESSAGES_FILE, [])
+        self.message_list.clear()
+        total = len(self.messages) if isinstance(self.messages, list) else 0
+        incoming = len([m for m in self.messages if m.get("direction") == "in"]) if isinstance(self.messages, list) else 0
+        current = _clean_number(self.to_number.text()) if hasattr(self, "to_number") else ""
+        current_valid = NUMBER_RE.match(current or "") is not None
+        if hasattr(self, "chat_status"):
+            self.chat_status.setText(f"{incoming} received | {total} total")
+        if hasattr(self, "tabs"):
+            index = self.tabs.indexOf(self.message_list.parentWidget())
+            if index >= 0:
+                self.tabs.setTabText(index, "Inbox / Chat")
+        if hasattr(self, "chat_contacts"):
+            selected = current if current_valid else ""
+            contacts = {}
+            for number, contact in self.contacts.items():
+                clean = _clean_number(number)
+                if NUMBER_RE.match(clean):
+                    contacts[clean] = self._contact_display_name(clean)
+            for msg in self.messages if isinstance(self.messages, list) else []:
+                number = msg.get("to") if msg.get("direction") == "out" else msg.get("from")
+                number = _clean_number(number)
+                if NUMBER_RE.match(number):
+                    name = msg.get("to_name") if msg.get("direction") == "out" else msg.get("from_name")
+                    contacts[number] = name or contacts.get(number, "")
+            self.chat_contacts.clear()
+            for number in sorted(contacts, key=lambda n: (n not in self.online_numbers, contacts[n].lower(), n)):
+                online = number in self.online_numbers
+                dot = "●" if online else "○"
+                name = contacts[number] or number
+                label = f"{dot} {name}\n{number}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, number)
+                item.setForeground(QColor("#52d273" if online else "#9fb8e8"))
+                self.chat_contacts.addItem(item)
+                if selected and number == selected:
+                    self.chat_contacts.setCurrentRow(self.chat_contacts.count() - 1)
+        if not self.messages:
+            self.message_list.setHtml(
+                "<div style='color:#9fb8e8;padding:18px;'>No messages yet. Type a Nerds Number above, then send.</div>"
+            )
+            self.last_message_count = 0
+            return
+        shown = []
+        for msg in self.messages[-160:]:
+            if current_valid:
+                other = msg.get("to") if msg.get("direction") == "out" else msg.get("from")
+                if _clean_number(other) != current:
+                    continue
+            shown.append(msg)
+        if not shown:
+            self.message_list.setHtml(
+                "<div style='color:#9fb8e8;padding:18px;'>No messages with this number yet.</div>"
+            )
+            self.last_message_count = total
+            return
+        rows = []
+        for msg in shown:
+            direction = msg.get("direction", "?")
+            other = msg.get("to") if direction == "out" else msg.get("from")
+            name = msg.get("to_name") if direction == "out" else msg.get("from_name")
+            label = f"{other} ({name})" if name else other
+            text = html.escape(str(msg.get("text", ""))).replace("\n", "<br>")
+            stamp = html.escape(str(msg.get("created_at", "")))
+            label = html.escape(str(label or "Unknown"))
+            if direction == "out":
+                align = "right"
+                bg = "#2f67c7"
+                fg = "#ffffff"
+                meta = "You"
+            else:
+                align = "left"
+                bg = "#14223b"
+                fg = "#e8f0ff"
+                meta = label
+            rows.append(
+                f"<div style='text-align:{align}; margin:10px 0;'>"
+                f"<div style='display:inline-block; max-width:72%; background:{bg}; color:{fg};"
+                f"padding:10px 12px; border-radius:10px;'>"
+                f"<div style='font-size:11px; color:#bdd0f5; margin-bottom:5px;'>{html.escape(meta)} | {stamp}</div>"
+                f"<div style='font-size:14px; line-height:1.35;'>{text}</div>"
+                f"</div></div>"
+            )
+        self.message_list.setHtml("".join(rows))
+        self.message_list.verticalScrollBar().setValue(self.message_list.verticalScrollBar().maximum())
+        self.last_message_count = total
+
+    def _select_chat_contact(self, item):
+        number = _clean_number(item.data(Qt.UserRole) or "")
+        if NUMBER_RE.match(number):
+            self.active_chat_number = number
+            self.to_number.setText(number)
+            if hasattr(self, "contact_name"):
+                self.contact_name.setText(self._contact_display_name(number))
+            self._fill_contact_url()
+            self._refresh_messages()
+
+    def _contact_display_name(self, number):
+        number = _clean_number(number)
+        contact = self.contacts.get(number, {})
+        if isinstance(contact, dict):
+            return (contact.get("display_name") or contact.get("name") or "").strip()
+        return ""
+
+    def _upsert_contact(self, number, name="", extra=None):
+        number = _clean_number(number)
+        if not NUMBER_RE.match(number or ""):
+            return False
+        old = self.contacts.get(number, {})
+        if not isinstance(old, dict):
+            old = {}
+        item = dict(old)
+        item["number"] = number
+        if name is not None:
+            clean_name = str(name or "").strip()
+            if clean_name:
+                item["display_name"] = clean_name
+            elif "display_name" not in item and "name" not in item:
+                item["display_name"] = ""
+        if extra:
+            item.update(extra)
+        item["updated_at"] = _now()
+        self.contacts[number] = item
+        _save_json(CONTACTS_FILE, self.contacts)
+        return True
+
+    def _save_chat_contact(self):
+        number = _clean_number(self.to_number.text())
+        if not NUMBER_RE.match(number or ""):
+            QMessageBox.warning(self, "Invalid Nerds Number", "Use 6 digits or +153 followed by 6 digits.")
+            return
+        name = self.contact_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Name required", "Type a contact name before saving.")
+            return
+        self._upsert_contact(number, name, {"source": "manual"})
+        self._refresh_messages()
+        self._fill_contact_url()
+        self._set_status(f"Saved {name} as {number}.")
+
+    def _poll_messages(self):
+        if not hasattr(self, "message_list"):
+            return
+        latest = _load_json(MESSAGES_FILE, [])
+        latest_count = len(latest) if isinstance(latest, list) else 0
+        if latest_count == self.last_message_count:
+            return
+        old_count = self.last_message_count
+        self._refresh_messages()
+        if latest_count > old_count:
+            added = latest_count - old_count
+            if hasattr(self, "tabs"):
+                index = self.tabs.indexOf(self.message_list.parentWidget())
+                if index >= 0:
+                    self.tabs.setTabText(index, f"Inbox / Chat ({added} new)")
+            if hasattr(self, "status"):
+                self._set_status(f"{added} new message(s) received. Open Inbox / Chat.")
+            if hasattr(self, "chat_status"):
+                self.chat_status.setText(f"{added} new message(s)")
+
+    def _heartbeat(self):
+        self._process_gate_events()
+        self._request_gate_online()
+        self._poll_messages()
+
+    def _request_gate_online(self, force=False):
+        client = self.gate_client
+        if client is None:
+            return
+        now_time = time.time()
+        if not force and now_time - self.last_online_check < 8:
+            return
+        try:
+            client.send({"protocol": "nerds.gate.v1", "type": "who"})
+            self.last_online_check = now_time
+        except Exception:
+            pass
+
+    def _process_gate_events(self):
+        changed = False
+        while True:
+            try:
+                item = self.gate_events.get_nowait()
+            except queue.Empty:
+                break
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type", "")
+            if kind == "gate_status":
+                self.gate_status = item.get("text", self.gate_status)
+                changed = True
+            elif kind == "registered":
+                self.gate_status = f"Internet Mode online as {item.get('number', '')}"
+                number = _clean_number(item.get("number", ""))
+                if NUMBER_RE.match(number or ""):
+                    self.online_numbers.add(number)
+                if hasattr(self, "chat_status"):
+                    self.chat_status.setText("Internet chat ready.")
+                self._request_gate_online(force=True)
+                self._refresh_messages()
+                changed = True
+            elif kind == "message":
+                payload = item.get("payload", item)
+                ok, result = self._receive_message(payload)
+                if ok:
+                    self._refresh_messages()
+                    self._set_status(f"Gate message received from {_clean_number(payload.get('from', ''))}.")
+                else:
+                    self._set_status(f"Gate message rejected: {result.get('error', 'invalid')}")
+            elif kind == "ack":
+                if item.get("ok"):
+                    self._set_status("Gate delivered the message.")
+                    if hasattr(self, "chat_status"):
+                        self.chat_status.setText("Delivered through Nerds Gate.")
+                else:
+                    self._set_status(f"Gate delivery failed: {item.get('error', 'target_offline')}")
+                    if hasattr(self, "chat_status"):
+                        self.chat_status.setText(f"Not delivered: {item.get('error', 'target_offline')}")
+            elif kind == "error":
+                self._set_status(f"Gate error: {item.get('error', 'unknown')}")
+                if hasattr(self, "chat_status"):
+                    self.chat_status.setText(f"Gate error: {item.get('error', 'unknown')}")
+            elif kind == "online":
+                self.online_numbers = {
+                    _clean_number(number)
+                    for number in item.get("numbers", [])
+                    if NUMBER_RE.match(_clean_number(number) or "")
+                }
+                self._refresh_messages()
+                if hasattr(self, "contact_route"):
+                    self._fill_contact_url()
+        if changed:
+            self._refresh_selfhost()
+            if hasattr(self, "contact_route"):
+                self._fill_contact_url()
+
+    def _refresh_feed(self):
+        self.feed_list.clear()
+        if not self.feed:
+            self.feed_list.addItem("Local feed is empty.")
+        else:
+            for post in reversed(self.feed[-80:]):
+                self.feed_list.addItem(
+                    f"{post.get('created_at')} | {post.get('author')} "
+                    f"({post.get('portal_number')}): {post.get('text')}"
+                )
+        self._refresh_peers()
+
+    def _refresh_peers(self):
+        if not hasattr(self, "peer_list"):
+            return
+        self.peer_list.clear()
+        merged = {}
+        for number, contact in self._load_discovery().items():
+            if isinstance(contact, dict):
+                merged[number] = contact
+        for number, contact in self.contacts.items():
+            if isinstance(contact, dict):
+                merged[number] = contact
+        if not merged:
+            self.peer_list.addItem("No online or saved numbers yet.")
+            return
+        for number, contact in sorted(merged.items()):
+            clean = _clean_number(number)
+            source = contact.get("source", "auto")
+            online = "online" if clean in self.online_numbers else "offline"
+            name = self._contact_display_name(clean)
+            label = f"{name} " if name else ""
+            self.peer_list.addItem(f"{label}{clean} | {online} | {source} | {contact.get('url', '')}")
+
+    def _refresh_drops(self):
+        self.drop_list.clear()
+        if not self.drops:
+            self.drop_list.addItem("File queue is empty.")
+            return
+        for item in reversed(self.drops[-80:]):
+            self.drop_list.addItem(
+                f"{item.get('created_at')} | {item.get('name')} | "
+                f"{item.get('size')} bytes | {item.get('path')}"
+            )
+
+    def _refresh_selfhost(self):
+        if not hasattr(self, "local_url"):
+            return
+        if self.httpd is not None:
+            self.local_url.setText(f"Online: {self._my_share_url()}")
+        else:
+            self.local_url.setText("Offline")
+        if hasattr(self, "my_contact_card"):
+            self.my_contact_card.setText(self._my_contact_card())
+        running = self.httpd is not None
+        label = "Go Offline" if running else "Go Online"
+        self.start_host_btn.setText(label)
+        if hasattr(self, "room_host_btn"):
+            self.room_host_btn.setText(label)
+        if hasattr(self, "gate_status_label"):
+            self.gate_status_label.setText(self.gate_status)
+        if hasattr(self, "gate_btn"):
+            self.gate_btn.setText("Disconnect Gate" if self.gate_client is not None else "Connect Gate")
+        if hasattr(self, "selfhost_info"):
+            number = _clean_number((self.identity or {}).get("portal_number", ""))
+            port = self._current_port()
+            ips = ", ".join(_local_ipv4s()) or "no LAN IP detected"
+            self.selfhost_info.setText(
+                f"Nerds Portal v{self.VERSION}\n"
+                f"My number: {number or 'Create Nerd ID first'}\n"
+                f"Route mode: {self._route_mode()}\n"
+                f"HTTP port: {port}\n"
+                f"LAN IPs: {ips}\n"
+                f"Discovery: {self.discovery_status}\n\n"
+                f"Nerds Gate: {self.gate_status}\n\n"
+                "LAN Mode uses direct local discovery. Internet Mode uses Nerds Gate. "
+                "Hybrid Auto tries LAN first, then Nerds Gate."
+            )
+
+    def _current_port(self):
+        try:
+            return int(self.selfhost.get("port", DEFAULT_SELF_PORT))
+        except Exception:
+            return DEFAULT_SELF_PORT
+
+    def _route_mode(self):
+        widget = getattr(self, "__dict__", {}).get("route_mode")
+        if widget is not None:
+            return widget.currentText()
+        return self.gate.get("mode", "Hybrid Auto Mode")
+
+    def _gate_url(self):
+        widget = getattr(self, "__dict__", {}).get("gate_url")
+        if widget is not None:
+            return widget.text().strip()
+        return self.gate.get("url", "")
+
+    def _save_gate_settings(self):
+        self.gate = {
+            "mode": self._route_mode(),
+            "url": self._gate_url(),
+            "updated_at": _now(),
+        }
+        _save_json(GATE_FILE, self.gate)
+        self._refresh_selfhost()
+
+    def _toggle_gate(self):
+        if self.gate_client is None:
+            self._connect_gate()
+        else:
+            self._disconnect_gate()
+
+    def _connect_gate(self):
+        if not self.identity:
+            QMessageBox.warning(self, "Nerd ID required", "Create a Nerd ID first.")
+            return
+        number = _clean_number(self.identity.get("portal_number", ""))
+        if not NUMBER_RE.match(number or ""):
+            QMessageBox.warning(self, "Invalid Nerds Number", "Use a valid +153 number before connecting.")
+            return
+        url = self._gate_url()
+        if not url.startswith(("ws://", "wss://")):
+            QMessageBox.warning(self, "Gate URL required", "Gate URL must start with ws:// or wss://.")
+            return
+        self._save_gate_settings()
+        self._disconnect_gate(silent=True)
+        self.gate_client = NerdsGateClient(self, url, self.gate_events)
+        self.gate_client.start()
+        self.gate_status = "Connecting to Nerds Gate..."
+        self._refresh_selfhost()
+
+    def _disconnect_gate(self, silent=False):
+        client = self.gate_client
+        self.gate_client = None
+        if client is not None:
+            client.stop()
+        self.gate_status = "Nerds Gate offline"
+        self.online_numbers = set()
+        self.last_online_check = 0
+        self._refresh_selfhost()
+        if hasattr(self, "contact_route"):
+            self._fill_contact_url()
+        if hasattr(self, "message_list"):
+            self._refresh_messages()
+        if not silent:
+            self._set_status("Nerds Gate disconnected.")
+
+    def _create_identity(self):
+        name = self.name_in.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Name required", "Enter a display name before creating a Nerd ID.")
+            return
+        device = self.device_in.text().strip() or f"{name} device"
+        existing = self.identity or {}
+        private_key = existing.get("private_key")
+        public_key = existing.get("public_key")
+        if not private_key or not public_key:
+            private_key, public_key = _keypair_stub()
+        portal_number = existing.get("portal_number")
+        if not NUMBER_RE.match(portal_number or ""):
+            portal_number = _new_nerds_number()
+        self.identity = {
+            "display_name": name,
+            "portal_number": portal_number,
+            "device_name": device,
+            "device_id": existing.get("device_id") or _new_device_id(name),
+            "public_key": public_key,
+            "private_key": private_key,
+            "trust_level": existing.get("trust_level", 0),
+            "privacy_default": self.privacy_in.currentText(),
+            "created_at": existing.get("created_at") or _now(),
+            "updated_at": _now(),
+            "note": "+153 is an internal Nerds Portal address, not a real telecom number.",
+        }
+        _save_json(IDENTITY_FILE, self.identity)
+        self._refresh_identity()
+        self._set_status("Nerd ID saved locally.")
+
+    def _regenerate_number(self):
+        if not self.identity:
+            self._create_identity()
+            return
+        reply = QMessageBox.question(
+            self,
+            "Generate new number",
+            "Generate a new +153 Nerds Number for this local identity?",
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.identity["portal_number"] = _new_nerds_number()
+        self.identity["updated_at"] = _now()
+        _save_json(IDENTITY_FILE, self.identity)
+        self._refresh_identity()
+        self._set_status("New +153 Nerds Number generated.")
+
+    def _create_room(self):
+        if not self.identity:
+            QMessageBox.warning(self, "Nerd ID required", "Create a Nerd ID first.")
+            return
+        title = self.room_title.text().strip() or "Untitled Portal"
+        room = {
+            "id": secrets.token_hex(8),
+            "title": title,
+            "room_type": self.room_type.currentText(),
+            "mode": self.room_mode.currentText(),
+            "code": _new_code("NRD"),
+            "host_number": self.identity.get("portal_number"),
+            "host_name": self.identity.get("display_name"),
+            "notes": self.room_notes.toPlainText().strip(),
+            "created_at": _now(),
+            "self_hosted": True,
+        }
+        self.rooms.append(room)
+        _save_json(ROOMS_FILE, self.rooms)
+        self.room_title.clear()
+        self.room_notes.clear()
+        self._refresh_rooms()
+        self._set_status(f"Created local room {room['code']}. Start Self Server to expose it.")
+
+    def _new_selected_room_code(self):
+        if not self.rooms:
+            QMessageBox.information(self, "No room", "Create a room first.")
+            return
+        self.rooms[-1]["code"] = _new_code("NRD")
+        self.rooms[-1]["updated_at"] = _now()
+        _save_json(ROOMS_FILE, self.rooms)
+        self._refresh_rooms()
+        self._set_status(f"New code for latest room: {self.rooms[-1]['code']}")
+
+    def _my_share_url(self):
+        public_url = ""
+        public_hint = getattr(self, "__dict__", {}).get("public_url_hint")
+        if public_hint is not None:
+            public_url = _normalize_url(public_hint.text())
+        if public_url:
+            return public_url
+        saved_url = _normalize_url(self.selfhost.get("url", ""))
+        if saved_url:
+            return saved_url
+        return f"http://127.0.0.1:{self._current_port()}"
+
+    def _bind_my_portal_url(self):
+        if not self.identity:
+            return
+        url = self._my_share_url()
+        self.identity["portal_url"] = url
+        self.identity["portal_port"] = self._current_port()
+        self.identity["updated_at"] = _now()
+        _save_json(IDENTITY_FILE, self.identity)
+
+    def _my_contact_card(self):
+        number = _clean_number((self.identity or {}).get("portal_number", ""))
+        url = self._my_share_url()
+        if not NUMBER_RE.match(number or ""):
+            return "Create Nerd ID first"
+        if not url:
+            return "Start Self Server first"
+        return f"NERDS-CARD {number} {url}"
+
+    def _copy_my_contact_card(self):
+        card = self._my_contact_card()
+        if not card.startswith("NERDS-CARD "):
+            QMessageBox.warning(self, "Contact card unavailable", card)
+            return
+        QApplication.clipboard().setText(card)
+        self._set_status("Contact card copied. Send it to the other Luci user once.")
+
+    def _load_discovery(self):
+        data = _load_json(DISCOVERY_FILE, {})
+        return data if isinstance(data, dict) else {}
+
+    def _save_discovery(self, data):
+        _save_json(DISCOVERY_FILE, data)
+
+    def _publish_discovery(self):
+        number = _clean_number((self.identity or {}).get("portal_number", ""))
+        url = self._my_share_url()
+        if not NUMBER_RE.match(number or "") or not url:
+            return
+        data = self._load_discovery()
+        data[number] = {
+            "url": url,
+            "name": self.identity.get("display_name", ""),
+            "device_id": self.identity.get("device_id", ""),
+            "port": self._current_port(),
+            "seen_at": _now(),
+        }
+        self._save_discovery(data)
+        self._broadcast_discovery("announce")
+
+    def _unpublish_discovery(self):
+        number = (self.identity or {}).get("portal_number", "")
+        if not NUMBER_RE.match(number or ""):
+            return
+        data = self._load_discovery()
+        if number in data:
+            data.pop(number, None)
+            self._save_discovery(data)
+        self._broadcast_discovery("stop")
+
+    def _discovery_payload(self, kind, target=""):
+        return {
+            "protocol": "nerds.portal.discovery.v1",
+            "kind": kind,
+            "target": _clean_number(target),
+            "number": _clean_number((self.identity or {}).get("portal_number", "")),
+            "name": (self.identity or {}).get("display_name", ""),
+            "device_id": (self.identity or {}).get("device_id", ""),
+            "port": self._current_port(),
+            "sent_at": _now(),
+        }
+
+    def _start_discovery_listener(self):
+        if self.discovery_sock is not None:
+            self.discovery_status = f"LAN discovery listening on UDP {DISCOVERY_PORT}"
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except Exception:
+                pass
+            sock.bind(("", DISCOVERY_PORT))
+            sock.settimeout(0.5)
+        except Exception as exc:
+            self.discovery_status = f"LAN discovery failed: {exc}"
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
+        self.discovery_sock = sock
+        self.discovery_stop = False
+        self.discovery_status = f"LAN discovery listening on UDP {DISCOVERY_PORT}"
+        self.discovery_thread = threading.Thread(target=self._discovery_loop, daemon=True)
+        self.discovery_thread.start()
+
+    def _stop_discovery_listener(self):
+        self.discovery_stop = True
+        sock = self.discovery_sock
+        self.discovery_sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        self.discovery_status = "LAN discovery offline"
+        self.discovery_thread = None
+
+    def _broadcast_discovery(self, kind, target=""):
+        payload = self._discovery_payload(kind, target)
+        if kind != "query" and not NUMBER_RE.match(payload.get("number", "")):
+            return
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        sock = self.discovery_sock
+        close_after = False
+        if sock is None:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                close_after = True
+            except Exception:
+                return
+        hosts = {"255.255.255.255", "127.255.255.255"}
+        for ip in _local_ipv4s():
+            parts = ip.split(".")
+            if len(parts) == 4:
+                hosts.add(".".join(parts[:3] + ["255"]))
+        for host in sorted(hosts):
+            try:
+                sock.sendto(raw, (host, DISCOVERY_PORT))
+            except Exception:
+                pass
+        if close_after:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _save_discovered_peer(self, item, addr_ip):
+        number = _clean_number(item.get("number", ""))
+        port = item.get("port")
+        if not NUMBER_RE.match(number or ""):
+            return
+        try:
+            port = int(port)
+        except Exception:
+            return
+        if port < 1 or port > 65535:
+            return
+        my_number = _clean_number((self.identity or {}).get("portal_number", ""))
+        if number == my_number:
+            return
+        url = f"http://{addr_ip}:{port}"
+        data = self._load_discovery()
+        data[number] = {
+            "url": url,
+            "name": item.get("name", ""),
+            "device_id": item.get("device_id", ""),
+            "port": port,
+            "seen_at": _now(),
+            "source": "lan",
+        }
+        self._save_discovery(data)
+
+    def _remove_discovered_peer(self, item):
+        number = _clean_number(item.get("number", ""))
+        if not NUMBER_RE.match(number or ""):
+            return
+        data = self._load_discovery()
+        if number in data:
+            data.pop(number, None)
+            self._save_discovery(data)
+
+    def _discovery_loop(self):
+        while not self.discovery_stop:
+            sock = self.discovery_sock
+            if sock is None:
+                return
+            try:
+                raw, addr = sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except Exception:
+                return
+            try:
+                item = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if item.get("protocol") != "nerds.portal.discovery.v1":
+                continue
+            kind = item.get("kind", "")
+            if kind == "announce":
+                self._save_discovered_peer(item, addr[0])
+            elif kind == "stop":
+                self._remove_discovered_peer(item)
+            elif kind == "query":
+                target = _clean_number(item.get("target", ""))
+                my_number = _clean_number((self.identity or {}).get("portal_number", ""))
+                if target == my_number and self.httpd is not None:
+                    reply = json.dumps(self._discovery_payload("announce"), ensure_ascii=False).encode("utf-8")
+                    try:
+                        sock.sendto(reply, addr)
+                    except Exception:
+                        pass
+
+    def _discover_number_lan(self, number, wait_seconds=1.5):
+        number = _clean_number(number)
+        if not NUMBER_RE.match(number or ""):
+            return ""
+        self._start_discovery_listener()
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            self._broadcast_discovery("query", number)
+            item = self._load_discovery().get(number, {})
+            if item.get("url"):
+                return _normalize_url(item.get("url"))
+            time.sleep(0.25)
+        item = self._load_discovery().get(number, {})
+        return _normalize_url(item.get("url", ""))
+
+    def _scan_lan_for_number(self, number):
+        number = _clean_number(number)
+        if not NUMBER_RE.match(number or ""):
+            return ""
+        prefixes = []
+        for ip in _local_ipv4s():
+            parts = ip.split(".")
+            if len(parts) == 4:
+                prefixes.append(".".join(parts[:3]))
+        prefixes = sorted(set(prefixes))
+        if not prefixes:
+            return ""
+        ports = [_preferred_port_for_number(number)]
+        ports.extend(range(DEFAULT_SELF_PORT, DEFAULT_SELF_PORT + 8))
+        ports = list(dict.fromkeys(ports))
+
+        def probe(host_port):
+            host, port = host_port
+            url = f"http://{host}:{port}"
+            try:
+                with urllib.request.urlopen(url + "/api/v1/profile", timeout=0.25) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                if _clean_number(data.get("number", "")) == number:
+                    return url, data
+            except Exception:
+                return None
+            return None
+
+        jobs = []
+        for prefix in prefixes:
+            for host_num in range(1, 255):
+                host = f"{prefix}.{host_num}"
+                for port in ports:
+                    jobs.append((host, port))
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=96) as pool:
+                for result in pool.map(probe, jobs):
+                    if not result:
+                        continue
+                    url, data = result
+                    discovery = self._load_discovery()
+                    discovery[number] = {
+                        "url": url,
+                        "name": data.get("name", ""),
+                        "device_id": data.get("device_id", ""),
+                        "seen_at": _now(),
+                        "source": "scan",
+                    }
+                    self._save_discovery(discovery)
+                    return url
+        except Exception:
+            return ""
+        return ""
+
+    def _resolve_number_url(self, number):
+        number = _clean_number(number)
+        item = self.contacts.get(number, {})
+        if item.get("url"):
+            url = _normalize_url(item.get("url"))
+            if self._url_matches_number(url, number):
+                return url
+            self.contacts.pop(number, None)
+            _save_json(CONTACTS_FILE, self.contacts)
+        item = self._load_discovery().get(number, {})
+        if item.get("url"):
+            url = _normalize_url(item.get("url"))
+            if self._url_matches_number(url, number):
+                self._upsert_contact(number, self._contact_display_name(number), {"url": url, "source": "auto"})
+                return url
+            data = self._load_discovery()
+            data.pop(number, None)
+            self._save_discovery(data)
+        url = self._discover_number_lan(number)
+        if url:
+            if self._url_matches_number(url, number):
+                self._upsert_contact(number, self._contact_display_name(number), {"url": url, "source": "auto"})
+                return url
+            data = self._load_discovery()
+            data.pop(number, None)
+            self._save_discovery(data)
+        return self._scan_lan_for_number(number)
+
+    def _url_matches_number(self, url, number, timeout=0.7):
+        url = _normalize_url(url)
+        number = _clean_number(number)
+        if not url or not NUMBER_RE.match(number or ""):
+            return False
+        try:
+            with urllib.request.urlopen(url + "/api/v1/profile", timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            return _clean_number(data.get("number", "")) == number
+        except Exception:
+            return False
+
+    def _save_selfhost_settings(self):
+        port = self._current_port()
+        if port < 1 or port > 65535:
+            QMessageBox.warning(self, "Invalid port", "Port must be between 1 and 65535.")
+            return
+        self.selfhost = {
+            "port": port,
+            "url": self.selfhost.get("url", f"http://{_local_ip()}:{port}"),
+            "public_url": _normalize_url(getattr(self, "__dict__", {}).get("public_url_hint").text()) if getattr(self, "__dict__", {}).get("public_url_hint") is not None else "",
+            "updated_at": _now(),
+        }
+        _save_json(SELFHOST_FILE, self.selfhost)
+        self._bind_my_portal_url()
+        self._publish_discovery()
+        self._refresh_identity()
+        self._refresh_selfhost()
+        self._set_status("Self-host URL bound to your +153 number.")
+
+    def _toggle_self_server(self):
+        if self.httpd is None:
+            self._start_self_server()
+        else:
+            self._stop_self_server()
+
+    def _start_self_server(self):
+        if not self.identity:
+            QMessageBox.warning(self, "Nerd ID required", "Create a Nerd ID first.")
+            return
+        if not NUMBER_RE.match(self.identity.get("portal_number", "")):
+            self.identity["portal_number"] = _new_nerds_number()
+            self.identity["updated_at"] = _now()
+            _save_json(IDENTITY_FILE, self.identity)
+            self._refresh_identity()
+        port = _find_free_port(_preferred_port_for_number(self.identity.get("portal_number", "")))
+        try:
+            handler = self._make_handler()
+            self.httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
+            self.http_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+            self.http_thread.start()
+        except Exception as exc:
+            self.httpd = None
+            self.http_thread = None
+            QMessageBox.warning(self, "Self server failed", str(exc))
+            return
+        self.selfhost["port"] = port
+        self.selfhost["url"] = f"http://{_local_ip()}:{port}"
+        self._start_discovery_listener()
+        self._save_selfhost_settings()
+        self._publish_discovery()
+        self._add_system_feed(f"Self server started at http://{_local_ip()}:{port}")
+        self._refresh_selfhost()
+        self._set_status(f"Online as {self.identity.get('portal_number')}. Send by number is ready.")
+
+    def _stop_self_server(self):
+        if self.snapshot_timer is not None:
+            try:
+                self.snapshot_timer.stop()
+                self.snapshot_timer.deleteLater()
+            except Exception:
+                pass
+            self.snapshot_timer = None
+            self.live_snapshot = {}
+            snapshot_btn = getattr(self, "__dict__", {}).get("snapshot_btn")
+            if snapshot_btn is not None:
+                snapshot_btn.setText("Start Snapshot Share")
+        server = self.httpd
+        self.httpd = None
+        self._unpublish_discovery()
+        self._stop_discovery_listener()
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+        self.http_thread = None
+        self._refresh_selfhost()
+        self._set_status("Self server stopped.")
+
+    def _make_handler(self):
+        portal = self
+
+        class PortalHandler(BaseHTTPRequestHandler):
+            server_version = f"NerdsPortalSelfHost/{portal.VERSION}"
+
+            def log_message(self, fmt, *args):
+                return
+
+            def _json(self, status, payload):
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _read_body(self):
+                size = int(self.headers.get("Content-Length", "0") or "0")
+                if size <= 0:
+                    return {}
+                raw = self.rfile.read(size).decode("utf-8", "replace")
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    return {}
+
+            def do_OPTIONS(self):
+                self._json(200, {"ok": True})
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                if parsed.path == "/":
+                    return self._json(200, portal._status_payload())
+                if parsed.path == "/api/v1/profile":
+                    return self._json(200, portal._public_profile())
+                if parsed.path == "/api/v1/rooms":
+                    return self._json(200, {"rooms": portal._public_rooms()})
+                if parsed.path == "/api/v1/feed":
+                    return self._json(200, {"feed": portal._public_feed()})
+                if parsed.path == "/api/v1/drops":
+                    return self._json(200, {"drops": portal._public_drops()})
+                if parsed.path == "/api/v1/live/snapshot":
+                    return self._json(200, portal._snapshot_payload())
+                return self._json(404, {"ok": False, "error": "not_found"})
+
+            def do_POST(self):
+                parsed = urlparse(self.path)
+                data = self._read_body()
+                if parsed.path == "/api/v1/messages/send":
+                    ok, result = portal._receive_message(data)
+                    return self._json(200 if ok else 400, result)
+                return self._json(404, {"ok": False, "error": "not_found"})
+
+        return PortalHandler
+
+    def _status_payload(self):
+        ident = self.identity or {}
+        return {
+            "ok": True,
+            "protocol": "nerds.portal.v1",
+            "app": "Nerds Portal",
+            "version": self.VERSION,
+            "name": ident.get("display_name", ""),
+            "number": ident.get("portal_number", ""),
+            "device_id": ident.get("device_id", ""),
+            "rooms": len(self.rooms),
+            "server_time": _now(),
+        }
+
+    def _public_profile(self):
+        ident = self.identity or {}
+        return {
+            "protocol": "nerds.portal.v1",
+            "name": ident.get("display_name", ""),
+            "number": ident.get("portal_number", ""),
+            "device_name": ident.get("device_name", ""),
+            "device_id": ident.get("device_id", ""),
+            "public_key": ident.get("public_key", ""),
+            "version": self.VERSION,
+        }
+
+    def _public_rooms(self):
+        return list(reversed(self.rooms[-50:]))
+
+    def _public_feed(self):
+        return list(reversed(self.feed[-50:]))
+
+    def _public_drops(self):
+        safe = []
+        for item in reversed(self.drops[-50:]):
+            safe.append({
+                "id": item.get("id", ""),
+                "name": item.get("name", ""),
+                "size": item.get("size", 0),
+                "created_at": item.get("created_at", ""),
+                "transfer_enabled": item.get("transfer_enabled", False),
+            })
+        return safe
+
+    def _snapshot_payload(self):
+        if not self.live_snapshot:
+            return {"ok": False, "error": "snapshot_not_shared"}
+        payload = dict(self.live_snapshot)
+        payload["ok"] = True
+        return payload
+
+    def _direct_request(self, method, base_url, path, payload=None, timeout=8):
+        base = _normalize_url(base_url)
+        if not base:
+            raise RuntimeError("Set the receiver URL first.")
+        data = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Portal HTTP {exc.code}: {exc.reason}")
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not reach contact Portal URL: {exc.reason}")
+
+    def _live_target_number(self):
+        number = _clean_number(self.live_number.text()) if hasattr(self, "live_number") else ""
+        if not NUMBER_RE.match(number):
+            QMessageBox.warning(self, "Invalid Nerds Number", "Use +153 followed by 6 digits.")
+            return ""
+        return number
+
+    def _live_target_url(self):
+        number = self._live_target_number()
+        if not number:
+            return "", ""
+        url = self._resolve_number_url(number)
+        if not url:
+            QMessageBox.warning(
+                self,
+                "Target not online",
+                "That +153 number was not found.\n\n"
+                "Open Nerds Portal on the target and press Go Online."
+            )
+            return number, ""
+        return number, url
+
+    def _check_live_target(self):
+        number, url = self._live_target_url()
+        if not url:
+            return
+        try:
+            data = self._direct_request("GET", url, "/api/v1/profile")
+        except Exception as exc:
+            QMessageBox.warning(self, "Live check failed", str(exc))
+            return
+        name = data.get("name", "Unknown")
+        device = data.get("device_name", "")
+        self.live_status.setText(f"Online: {name} {number} {device}")
+        self.live_view.setText(json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _fetch_live_rooms(self):
+        number, url = self._live_target_url()
+        if not url:
+            return
+        try:
+            data = self._direct_request("GET", url, "/api/v1/rooms")
+        except Exception as exc:
+            QMessageBox.warning(self, "Rooms failed", str(exc))
+            return
+        self.live_view.setText(json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _fetch_live_feed(self):
+        number, url = self._live_target_url()
+        if not url:
+            return
+        try:
+            data = self._direct_request("GET", url, "/api/v1/feed")
+        except Exception as exc:
+            QMessageBox.warning(self, "Feed failed", str(exc))
+            return
+        self.live_view.setText(json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _fetch_live_drops(self):
+        number, url = self._live_target_url()
+        if not url:
+            return
+        try:
+            data = self._direct_request("GET", url, "/api/v1/drops")
+        except Exception as exc:
+            QMessageBox.warning(self, "Files failed", str(exc))
+            return
+        self.live_view.setText(json.dumps(data, indent=2, ensure_ascii=False))
+
+    def _toggle_snapshot_share(self):
+        if self.snapshot_timer is not None:
+            self.snapshot_timer.stop()
+            self.snapshot_timer.deleteLater()
+            self.snapshot_timer = None
+            self.live_snapshot = {}
+            self.snapshot_btn.setText("Start Snapshot Share")
+            self._set_status("Snapshot share stopped.")
+            return
+        if self.httpd is None:
+            QMessageBox.warning(self, "Go Online first", "Press Go Online before sharing a snapshot.")
+            return
+        self._capture_snapshot()
+        self.snapshot_timer = QTimer(self)
+        self.snapshot_timer.timeout.connect(self._capture_snapshot)
+        self.snapshot_timer.start(2500)
+        self.snapshot_btn.setText("Stop Snapshot Share")
+        self._set_status("Snapshot share is live.")
+
+    def _capture_snapshot(self):
+        try:
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                return
+            pix = screen.grabWindow(0)
+            pix = pix.scaled(960, 540, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            raw = QByteArray()
+            buf = QBuffer(raw)
+            buf.open(QIODevice.WriteOnly)
+            pix.save(buf, "PNG")
+            buf.close()
+            self.live_snapshot = {
+                "protocol": "nerds.portal.v1",
+                "kind": "snapshot",
+                "from": self.identity.get("portal_number", ""),
+                "from_name": self.identity.get("display_name", ""),
+                "updated_at": _now(),
+                "mime": "image/png",
+                "image_b64": bytes(raw.toBase64()).decode("ascii"),
+            }
+        except Exception as exc:
+            self._set_status(f"Snapshot failed: {exc}")
+
+    def _view_live_snapshot(self):
+        number, url = self._live_target_url()
+        if not url:
+            return
+        try:
+            data = self._direct_request("GET", url, "/api/v1/live/snapshot")
+        except Exception as exc:
+            QMessageBox.warning(self, "Snapshot failed", str(exc))
+            return
+        if not data.get("ok"):
+            QMessageBox.information(self, "No snapshot", "Target has not started Snapshot Share.")
+            return
+        image_b64 = data.get("image_b64", "")
+        if not image_b64:
+            QMessageBox.information(self, "No snapshot", "Target snapshot is empty.")
+            return
+        html = (
+            f"<h3>{data.get('from_name', '')} {data.get('from', number)}</h3>"
+            f"<p>{data.get('updated_at', '')}</p>"
+            f"<img src='data:image/png;base64,{image_b64}' width='900'>"
+        )
+        self.live_view.setHtml(html)
+
+    def _fill_contact_url(self):
+        number = _clean_number(self.to_number.text())
+        if not hasattr(self, "contact_route"):
+            return
+        if NUMBER_RE.match(number or "") and hasattr(self, "contact_name"):
+            if number != self.active_chat_number:
+                self.active_chat_number = number
+                self.contact_name.setText(self._contact_display_name(number))
+        url = self._resolve_number_url(number) if NUMBER_RE.match(number) else ""
+        if url:
+            self.contact_route.setText("Ready. This contact can receive direct messages.")
+        elif NUMBER_RE.match(number) and number in self.online_numbers:
+            self.contact_route.setText("● Online now through Nerds Gate. Message can be delivered.")
+        elif NUMBER_RE.match(number) and self.gate_client is not None:
+            self.contact_route.setText("○ Not online on Nerds Gate yet. Message may fail until they connect.")
+        elif NUMBER_RE.match(number):
+            self.contact_route.setText("Waiting for connection. Open Network, connect Gate, then send.")
+        else:
+            self.contact_route.setText("Type 6 digits or a +153 Nerds Number.")
+
+    def _parse_contact_card(self, text):
+        text = (text or "").strip()
+        if not text:
+            return "", ""
+        parts = text.replace("\n", " ").replace("\t", " ").split()
+        number = _clean_number(text) if NUMBER_RE.match(_clean_number(text)) else ""
+        url = ""
+        for part in parts:
+            cleaned = _clean_number(part)
+            if NUMBER_RE.match(cleaned):
+                number = cleaned
+            elif part.startswith(("http://", "https://")):
+                url = _normalize_url(part)
+        return number, url
+
+    def _import_contact_card(self):
+        number, url = self._parse_contact_card(self.contact_card_in.text())
+        if not NUMBER_RE.match(number):
+            QMessageBox.warning(self, "Invalid contact card", "Contact card must include a +153 Nerds Number.")
+            return
+        if not url:
+            QMessageBox.warning(self, "Invalid contact card", "Contact card must include the receiver URL.")
+            return
+        self._upsert_contact(number, self._contact_display_name(number), {"url": url, "source": "card"})
+        self.to_number.setText(number)
+        self.contact_card_in.clear()
+        self._fill_contact_url()
+        self._refresh_peers()
+        self._set_status(f"Bound {number} to its receiver URL.")
+
+    def _send_message(self):
+        if not self.identity:
+            QMessageBox.warning(self, "Nerd ID required", "Create a Nerd ID first.")
+            return
+        to_number = _clean_number(self.to_number.text())
+        if not NUMBER_RE.match(to_number):
+            QMessageBox.warning(self, "Invalid Nerds Number", "Use +153 followed by 6 digits.")
+            return
+        text = self.chat_text.toPlainText().strip()
+        if not text:
+            return
+        contact_name = self.contact_name.text().strip() if hasattr(self, "contact_name") else ""
+        if contact_name:
+            self._upsert_contact(to_number, contact_name, {"source": "manual"})
+        mode = self._route_mode()
+        if mode == "Internet Mode":
+            if self._send_gate_message(to_number, text):
+                return
+            QMessageBox.warning(self, "Nerds Gate unavailable", "Connect to Nerds Gate first, then try again.")
+            return
+        url = self._resolve_number_url(to_number)
+        if not url and mode == "Hybrid Auto Mode":
+            if self._send_gate_message(to_number, text):
+                return
+        if not url:
+            QMessageBox.warning(
+                self,
+                "Receiver not online",
+                "The app could not auto-find that +153 number.\n\n"
+                "Use LAN Mode with both apps online, or connect both users to Nerds Gate for Internet Mode."
+            )
+            return
+        payload = {
+            "protocol": "nerds.portal.v1",
+            "from": self.identity.get("portal_number"),
+            "from_name": self.identity.get("display_name"),
+            "from_device_id": self.identity.get("device_id"),
+            "to": to_number,
+            "text": text,
+            "sent_at": _now(),
+        }
+        try:
+            result = self._direct_request("POST", url, "/api/v1/messages/send", payload)
+        except Exception as exc:
+            QMessageBox.warning(self, "Message send failed", str(exc))
+            return
+        if not result.get("ok", False):
+            QMessageBox.warning(self, "Message rejected", result.get("error", "The contact portal rejected the message."))
+            return
+        msg = {
+            "id": secrets.token_hex(8),
+            "direction": "out",
+            "from": payload["from"],
+            "to": to_number,
+            "to_name": self._contact_display_name(to_number),
+            "text": text,
+            "created_at": payload["sent_at"],
+            "contact_url": url,
+        }
+        self.messages.append(msg)
+        _save_json(MESSAGES_FILE, self.messages)
+        self._upsert_contact(to_number, self.contact_name.text().strip(), {"url": url, "source": "direct"})
+        self.chat_text.clear()
+        self._refresh_messages()
+        self._refresh_peers()
+        self._set_status(f"Message sent directly to {to_number}.")
+
+    def _send_gate_message(self, to_number, text):
+        client = self.gate_client
+        if client is None:
+            return False
+        contact_name = self.contact_name.text().strip() if hasattr(self, "contact_name") else ""
+        if contact_name:
+            self._upsert_contact(to_number, contact_name, {"source": "manual"})
+        payload = {
+            "protocol": "nerds.portal.v1",
+            "from": self.identity.get("portal_number"),
+            "from_name": self.identity.get("display_name"),
+            "from_device_id": self.identity.get("device_id"),
+            "to": to_number,
+            "to_name": self._contact_display_name(to_number),
+            "text": text,
+            "sent_at": _now(),
+        }
+        try:
+            client.send({
+                "protocol": "nerds.gate.v1",
+                "type": "message",
+                "to": to_number,
+                "payload": payload,
+            })
+        except Exception as exc:
+            self.gate_status = f"Gate send failed: {exc}"
+            self._refresh_selfhost()
+            return False
+        msg = {
+            "id": secrets.token_hex(8),
+            "direction": "out",
+            "from": payload["from"],
+            "to": to_number,
+            "to_name": payload.get("to_name", ""),
+            "text": text,
+            "created_at": payload["sent_at"],
+            "contact_url": "Nerds Gate",
+        }
+        self.messages.append(msg)
+        _save_json(MESSAGES_FILE, self.messages)
+        self.chat_text.clear()
+        self._refresh_messages()
+        self._set_status(f"Sending to {to_number} through Nerds Gate...")
+        if hasattr(self, "chat_status"):
+            self.chat_status.setText("Sending through Nerds Gate...")
+        return True
+
+    def _receive_message(self, item):
+        if not isinstance(item, dict):
+            return False, {"ok": False, "error": "invalid_payload"}
+        to_number = item.get("to", "")
+        my_number = (self.identity or {}).get("portal_number", "")
+        if my_number and to_number and to_number != my_number:
+            return False, {"ok": False, "error": "wrong_recipient"}
+        text = (item.get("text") or "").strip()
+        from_number = _clean_number(item.get("from") or "")
+        if not NUMBER_RE.match(from_number) or not text:
+            return False, {"ok": False, "error": "invalid_message"}
+        self._upsert_contact(from_number, item.get("from_name", ""), {"source": "message"})
+        msg = {
+            "id": item.get("id") or secrets.token_hex(8),
+            "direction": "in",
+            "from": from_number,
+            "from_name": item.get("from_name", ""),
+            "from_device_id": item.get("from_device_id", ""),
+            "to": my_number or to_number,
+            "text": text,
+            "created_at": item.get("sent_at") or _now(),
+        }
+        seen = {
+            (m.get("direction"), m.get("from"), m.get("to"), m.get("text"), m.get("created_at"))
+            for m in self.messages
+        }
+        key = (msg.get("direction"), msg.get("from"), msg.get("to"), msg.get("text"), msg.get("created_at"))
+        if key not in seen:
+            self.messages.append(msg)
+            _save_json(MESSAGES_FILE, self.messages)
+        if hasattr(self, "to_number") and not self.to_number.text().strip():
+            self.to_number.setText(from_number)
+        return True, {"ok": True, "received_at": _now(), "id": msg["id"]}
+
+    def _add_system_feed(self, text):
+        name = self.identity.get("display_name", "System") if self.identity else "System"
+        number = self.identity.get("portal_number", "+153000000") if self.identity else "+153000000"
+        self.feed.append({
+            "id": secrets.token_hex(8),
+            "author": name,
+            "portal_number": number,
+            "text": text,
+            "created_at": _now(),
+            "local_only": True,
+        })
+        _save_json(FEED_FILE, self.feed)
+        self._refresh_feed()
+
+    def _add_feed(self):
+        if not self.identity:
+            QMessageBox.warning(self, "Nerd ID required", "Create a Nerd ID first.")
+            return
+        text = self.feed_text.toPlainText().strip()
+        if not text:
+            return
+        self.feed.append({
+            "id": secrets.token_hex(8),
+            "author": self.identity.get("display_name"),
+            "portal_number": self.identity.get("portal_number"),
+            "text": text,
+            "created_at": _now(),
+            "local_only": True,
+        })
+        _save_json(FEED_FILE, self.feed)
+        self.feed_text.clear()
+        self._refresh_feed()
+        self._set_status("Local feed post added.")
+
+    def _clear_feed(self):
+        self.feed = []
+        _save_json(FEED_FILE, self.feed)
+        self._refresh_feed()
+        self._set_status("Local feed cleared.")
+
+    def _choose_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose file to queue for Portal Drop")
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            size = 0
+        self.drops.append({
+            "id": secrets.token_hex(8),
+            "path": path,
+            "name": os.path.basename(path),
+            "size": size,
+            "created_at": _now(),
+            "transfer_enabled": False,
+        })
+        _save_json(DROP_FILE, self.drops)
+        self._refresh_drops()
+        self._set_status("File added to local drop queue.")
+
+    def _clear_drops(self):
+        self.drops = []
+        _save_json(DROP_FILE, self.drops)
+        self._refresh_drops()
+        self._set_status("File queue cleared.")
+
+    def _set_status(self, text):
+        self.status.setText(text)
+
+    def closeEvent(self, e):
+        try:
+            if self.message_timer is not None:
+                try:
+                    self.message_timer.stop()
+                    self.message_timer.deleteLater()
+                except Exception:
+                    pass
+                self.message_timer = None
+            self._disconnect_gate(silent=True)
+            self._stop_self_server()
+            if self._desk is not None and hasattr(self._desk, "_windows"):
+                try:
+                    self._desk._windows.remove(self)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+
+def main(desktop):
+    win = NerdsPortal(desktop)
+    win.show()
+    try:
+        win.raise_()
+        win.activateWindow()
+    except Exception:
+        pass
+    try:
+        if hasattr(desktop, "_windows") and win not in desktop._windows:
+            desktop._windows.append(win)
+    except Exception:
+        pass
+    return win
+
+
+if __name__ == "__main__":
+    app = QApplication([])
+    w = NerdsPortal(None)
+    w.show()
+    app.exec_()

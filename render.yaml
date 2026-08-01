@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: nerds-gate
+    runtime: python
+    plan: free
+    buildCommand: "python -m py_compile nerds_gate.py"
+    startCommand: "python nerds_gate.py"

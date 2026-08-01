@@ -1,0 +1,9 @@
+Nerds Gate Relay Server
+
+International relay for Nerds Portal. Users connect outbound through WebSocket, so chat can work across countries even behind router NAT, CGNAT, hotel WiFi, or mobile data. LAN stays direct; Internet Mode uses the Gate.
+
+Short caption:
+Nerds Gate lets Nerds Portal users connect internationally by +153 number through an outbound WebSocket relay. No per-user port forwarding, no ngrok, no LAN requirement.
+
+GitHub description:
+International WebSocket relay server for Nerds Portal, routing +153 users across NAT/CGNAT through outbound connections.
